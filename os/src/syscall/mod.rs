@@ -31,7 +31,7 @@ use process::*;
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
-    //负责在系统调用入口增加当前进程的syscall计数
+    //负责在系统调用入口增加当前进程的syscall计数；ai帮助找到这段代码
     increase_current_syscall_count(syscall_id);
     match syscall_id {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
