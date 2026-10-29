@@ -14,7 +14,9 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MapPermission;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -133,6 +135,46 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Map a framed area into the current running task.
+    pub fn mmap_current(&self, start: usize, end: usize, permission: MapPermission) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+
+        inner.tasks[cur]
+            .memory_set
+            .insert_framed_area_checked(start.into(), end.into(), permission)
+    }
+
+    /// Unmap a framed area from the current running task.
+    pub fn munmap_current(&self, start: usize, end: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+
+        inner.tasks[cur]
+            .memory_set
+            .remove_framed_area_checked(start.into(), end.into())
+    }
+
+    /// Increase the current task's counter for one syscall.
+    pub fn increase_current_syscall_count(&self, syscall_id: usize) -> bool {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return false;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+        true
+    }
+
+    /// Read one syscall counter from the current task.
+    pub fn get_current_syscall_count(&self, syscall_id: usize) -> Option<usize> {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return None;
+        }
+        let inner = self.inner.exclusive_access();
+        Some(inner.tasks[inner.current_task].syscall_times[syscall_id])
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +243,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Map a framed area into the current running task.
+pub fn mmap_current(start: usize, end: usize, permission: MapPermission) -> bool {
+    TASK_MANAGER.mmap_current(start, end, permission)
+}
+
+/// Unmap a framed area from the current running task.
+pub fn munmap_current(start: usize, end: usize) -> bool {
+    TASK_MANAGER.munmap_current(start, end)
+}
+
+/// Increase the current task's counter for one syscall.
+pub fn increase_current_syscall_count(syscall_id: usize) -> bool {
+    TASK_MANAGER.increase_current_syscall_count(syscall_id)
+}
+
+/// Read one syscall counter from the current task.
+pub fn get_current_syscall_count(syscall_id: usize) -> Option<usize> {
+    TASK_MANAGER.get_current_syscall_count(syscall_id)
 }

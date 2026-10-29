@@ -179,3 +179,64 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     }
     v
 }
+
+fn user_page(token: usize, addr: usize, writable: bool) -> Option<(PhysPageNum, usize)> {
+    let va = VirtAddr::from(addr);
+    if usize::from(va) != addr {
+        return None;
+    }
+    let pte = PageTable::from_token(token).translate(va.floor())?;
+    let flags = pte.flags();
+    if !pte.is_valid()
+        || !flags.contains(PTEFlags::U)
+        || if writable {
+            !pte.writable()
+        } else {
+            !pte.readable()
+        }
+    {
+        return None;
+    }
+    Some((pte.ppn(), va.page_offset()))
+}
+
+/// Read one byte from a readable page in the current user's address space.
+pub fn read_user_byte(token: usize, addr: usize) -> Option<u8> {
+    let (ppn, offset) = user_page(token, addr, false)?;
+    Some(ppn.get_bytes_array()[offset])
+}
+
+/// Write one byte to a writable page in the current user's address space.
+pub fn write_user_byte(token: usize, addr: usize, value: u8) -> bool {
+    let Some((ppn, offset)) = user_page(token, addr, true) else {
+        return false;
+    };
+    ppn.get_bytes_array()[offset] = value;
+    true
+}
+
+/// Copy bytes to user memory after validating the complete destination range.
+pub fn copy_to_user(token: usize, dst: usize, src: &[u8]) -> bool {
+    let Some(end) = dst.checked_add(src.len()) else {
+        return false;
+    };
+
+    let mut current = dst;
+    while current < end {
+        let Some((_, offset)) = user_page(token, current, true) else {
+            return false;
+        };
+        current += (4096 - offset).min(end - current);
+    }
+
+    current = dst;
+    let mut copied = 0;
+    while current < end {
+        let (ppn, offset) = user_page(token, current, true).unwrap();
+        let len = (4096 - offset).min(end - current);
+        ppn.get_bytes_array()[offset..offset + len].copy_from_slice(&src[copied..copied + len]);
+        current += len;
+        copied += len;
+    }
+    true
+}
