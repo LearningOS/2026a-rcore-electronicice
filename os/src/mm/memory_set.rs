@@ -60,6 +60,83 @@ impl MemorySet {
             None,
         );
     }
+
+    // ==================== 修改块开始：受检映射创建 ====================
+    // 修改内容：增加“确认目标虚拟页全部空闲后再建立映射”的安全入口。
+    // 修改原因：mmap 对重复映射必须返回失败，不能让底层页表断言导致内核崩溃。
+    // 上下文：由当前任务的 mmap 接口调用，下游复用已有 insert_framed_area 完成实际映射。
+    // 输入：映射起止虚拟地址和用户要求的页权限。
+    // 输出：成功建立整段映射返回 true；任一页已映射则不改变状态并返回 false。
+    // 作用：先验证完整区间，再把合法请求交给已有映射机制。
+    // 抽象位置：地址空间状态所有者中的安全检查层。
+    /// Insert a framed area only when every target page is currently free.
+    pub fn insert_framed_area_checked(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if self.translate(vpn).is_some_and(|pte| pte.is_valid()) {
+                return false;
+            }
+        }
+
+        self.insert_framed_area(start_va, end_va, permission);
+        true
+    }
+    // ==================== 修改块结束：受检映射创建 ====================
+
+    // ==================== 修改块开始：受检映射释放 ====================
+    // 修改内容：增加对指定虚拟区间的完整校验、解除映射和剩余区域重建。
+    // 修改原因：munmap 既要拒绝未映射区间，也要支持从已有 MapArea 中删除局部页面。
+    // 上下文：由当前任务的 munmap 接口调用，直接管理 MemorySet 的 areas 和页表。
+    // 输入：需要解除映射的起止虚拟地址。
+    // 输出：整段可删除时释放对应页面并返回 true；区间无效时保持原状并返回 false。
+    // 作用：把一个连续删除请求转换为逐页 unmap，并保留删除区间两侧仍有效的子区域。
+    // 抽象位置：地址空间状态所有者中的映射生命周期机制。
+    /// Remove a mapped range and release the physical frames it owns.
+    pub fn remove_framed_area_checked(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            let is_mapped = self.translate(vpn).is_some_and(|pte| pte.is_valid());
+            let is_managed = self.areas.iter().any(|area| area.contains(vpn));
+            if !is_mapped || !is_managed {
+                return false;
+            }
+        }
+
+        let mut retained = Vec::new();
+        for mut area in self.areas.drain(..) {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            let overlap_start = VirtPageNum(area_start.0.max(start_vpn.0));
+            let overlap_end = VirtPageNum(area_end.0.min(end_vpn.0));
+
+            if overlap_start.0 >= overlap_end.0 {
+                retained.push(area);
+                continue;
+            }
+
+            for vpn in VPNRange::new(overlap_start, overlap_end) {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+            if area_start.0 < overlap_start.0 {
+                retained.push(area.take_subarea(area_start, overlap_start));
+            }
+            if overlap_end.0 < area_end.0 {
+                retained.push(area.take_subarea(overlap_end, area_end));
+            }
+        }
+        self.areas = retained;
+        true
+    }
+    // ==================== 修改块结束：受检映射释放 ====================
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -310,6 +387,36 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    // ==================== 修改块开始：映射区域拆分辅助 ====================
+    // 修改内容：增加区间归属判断和拆分后子区域的所有权转移辅助方法。
+    // 修改原因：局部 munmap 后需要判断页面属于哪个 MapArea，并让剩余页面继续持有原物理帧。
+    // 上下文：仅由 MemorySet::remove_framed_area_checked 在重建 areas 时使用。
+    // 输入：待判断的虚拟页号，或需要保留的子区间起止页号。
+    // 输出：页面归属布尔值，或持有对应 data_frames 的新 MapArea。
+    // 作用：为上层解除映射流程提供“判断区间”和“切分所有权”两个黑箱操作。
+    // 抽象位置：单个映射区域内部的数据所有权机制。
+    fn contains(&self, vpn: VirtPageNum) -> bool {
+        let start = self.vpn_range.get_start();
+        let end = self.vpn_range.get_end();
+        start.0 <= vpn.0 && vpn.0 < end.0
+    }
+
+    fn take_subarea(&mut self, start: VirtPageNum, end: VirtPageNum) -> Self {
+        let mut data_frames = BTreeMap::new();
+        for vpn in VPNRange::new(start, end) {
+            if let Some(frame) = self.data_frames.remove(&vpn) {
+                data_frames.insert(vpn, frame);
+            }
+        }
+        Self {
+            vpn_range: VPNRange::new(start, end),
+            data_frames,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+        }
+    }
+    // ==================== 修改块结束：映射区域拆分辅助 ====================
+
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,

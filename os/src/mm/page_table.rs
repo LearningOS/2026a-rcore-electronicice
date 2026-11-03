@@ -213,3 +213,67 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
         .unwrap()
         .get_mut()
 }
+
+// ==================== 修改块开始：用户页面受检翻译 ====================
+// 修改内容：增加用户虚拟地址到可访问物理页及页内偏移的受检翻译入口。
+// 修改原因：内核写回系统调用结果前必须确认地址有效、属于用户页且具备所需权限。
+// 上下文：由 copy_to_user 使用，依赖当前任务页表 token 和页表项权限位。
+// 输入：用户页表 token、用户虚拟地址以及本次访问是否要求可写。
+// 输出：合法时返回物理页号和页内偏移；地址或权限非法时返回 None。
+// 作用：把裸用户地址转换成经过页表和权限验证的内核可访问位置。
+// 抽象位置：用户态与内核态之间的内存安全边界。
+fn user_page(token: usize, addr: usize, writable: bool) -> Option<(PhysPageNum, usize)> {
+    let va = VirtAddr::from(addr);
+    if usize::from(va) != addr {
+        return None;
+    }
+    let pte = PageTable::from_token(token).translate(va.floor())?;
+    let flags = pte.flags();
+    if !pte.is_valid()
+        || !flags.contains(PTEFlags::U)
+        || if writable {
+            !pte.writable()
+        } else {
+            !pte.readable()
+        }
+    {
+        return None;
+    }
+    Some((pte.ppn(), va.page_offset()))
+}
+// ==================== 修改块结束：用户页面受检翻译 ====================
+
+// ==================== 修改块开始：跨页写回用户内存 ====================
+// 修改内容：增加支持跨页的、先完整验证再写入的用户内存复制操作。
+// 修改原因：TimeVal 可能跨越两个页面，直接转换成单个引用会漏检后半段地址和权限。
+// 上下文：由 sys_get_time 调用，底层通过 user_page 验证每一个涉及的用户页面。
+// 输入：用户页表 token、目标用户地址和待写入字节切片。
+// 输出：完整写入返回 true；任一页面非法时不开始写入并返回 false。
+// 作用：先验证整个目标区间，再按页拆分数据并写回用户地址空间。
+// 抽象位置：系统调用结果写回的跨页适配层。
+/// Copy bytes to user memory after validating the complete destination range.
+pub fn copy_to_user(token: usize, dst: usize, src: &[u8]) -> bool {
+    let Some(end) = dst.checked_add(src.len()) else {
+        return false;
+    };
+
+    let mut current = dst;
+    while current < end {
+        let Some((_, offset)) = user_page(token, current, true) else {
+            return false;
+        };
+        current += (4096 - offset).min(end - current);
+    }
+
+    current = dst;
+    let mut copied = 0;
+    while current < end {
+        let (ppn, offset) = user_page(token, current, true).unwrap();
+        let len = (4096 - offset).min(end - current);
+        ppn.get_bytes_array()[offset..offset + len].copy_from_slice(&src[copied..copied + len]);
+        current += len;
+        copied += len;
+    }
+    true
+}
+// ==================== 修改块结束：跨页写回用户内存 ====================
